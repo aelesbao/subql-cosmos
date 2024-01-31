@@ -2,11 +2,20 @@
 // SPDX-License-Identifier: GPL-3.0
 
 import { TextDecoder } from 'util';
-import { CosmWasmClient, IndexedTx } from '@cosmjs/cosmwasm-stargate';
-import { toHex } from '@cosmjs/encoding';
+import {
+  CosmWasmClient,
+  IndexedTx,
+  JsonObject,
+} from '@cosmjs/cosmwasm-stargate';
+import { fromUtf8, toHex, toUtf8 } from '@cosmjs/encoding';
 import { Uint53 } from '@cosmjs/math';
 import { DecodeObject, GeneratedType, Registry } from '@cosmjs/proto-signing';
-import { Block, defaultRegistryTypes } from '@cosmjs/stargate';
+import {
+  Block,
+  defaultRegistryTypes,
+  ProtobufRpcClient,
+  QueryClient,
+} from '@cosmjs/stargate';
 import {
   Tendermint37Client,
   toRfc3339WithNanoseconds,
@@ -25,6 +34,7 @@ import {
   ApiService as BaseApiService,
 } from '@subql/node-core';
 import { CosmWasmSafeClient } from '@subql/types-cosmos/interfaces';
+import { QueryClientImpl } from 'cosmjs-types/cosmwasm/wasm/v1/query';
 import {
   MsgClearAdmin,
   MsgExecuteContract,
@@ -216,11 +226,17 @@ export class CosmosSafeClient
   extends CosmWasmClient
   implements CosmWasmSafeClient
 {
-  height: number;
+  readonly height: number;
+  private readonly safeQueryClient: QueryClient & SafeWasmExtension;
 
   constructor(tmClient: Tendermint37Client, height: number) {
     super(tmClient);
+
     this.height = height;
+    this.safeQueryClient = QueryClient.withExtensions(
+      tmClient,
+      setupSafeWasmExtension(height),
+    );
   }
 
   // Deprecate
@@ -278,4 +294,94 @@ export class CosmosSafeClient
       };
     });
   }
+
+  async queryContractSmart(
+    address: string,
+    queryMsg: JsonObject,
+  ): Promise<JsonObject> {
+    try {
+      return await this.safeQueryClient.wasm.queryContractSmart(
+        address,
+        queryMsg,
+      );
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message.startsWith('not found: contract')) {
+          throw new Error(`No contract found at address "${address}"`);
+        } else {
+          throw error;
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
+interface SafeWasmExtension {
+  readonly wasm: {
+    readonly queryContractSmart: (
+      address: string,
+      query: JsonObject,
+      height?: number,
+    ) => Promise<JsonObject>;
+  };
+}
+
+function setupSafeWasmExtension(
+  height?: number,
+): (base: QueryClient) => SafeWasmExtension {
+  return (base: QueryClient) => {
+    const rpc = createProtobufRpcClient(base, height);
+    const queryService = new QueryClientImpl(rpc);
+
+    return {
+      wasm: {
+        queryContractSmart: async (
+          address: string,
+          query: JsonObject,
+        ): Promise<JsonObject> => {
+          const request = {
+            address: address,
+            queryData: toUtf8(JSON.stringify(query)),
+          };
+          const { data } = await queryService.SmartContractState(request);
+          // By convention, smart queries must return a valid JSON document (see https://github.com/CosmWasm/cosmwasm/issues/144)
+          let responseText: string;
+          try {
+            responseText = fromUtf8(data);
+          } catch (error) {
+            throw new Error(
+              `Could not UTF-8 decode smart query response from contract: ${error}`,
+            );
+          }
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+            return JSON.parse(responseText);
+          } catch (error) {
+            throw new Error(
+              `Could not JSON parse smart query response from contract: ${error}`,
+            );
+          }
+        },
+      },
+    };
+  };
+}
+
+function createProtobufRpcClient(
+  base: QueryClient,
+  height?: number,
+): ProtobufRpcClient {
+  return {
+    request: async (
+      service: string,
+      method: string,
+      data: Uint8Array,
+    ): Promise<Uint8Array> => {
+      const path = `/${service}/${method}`;
+      const response = await base.queryAbci(path, data, height);
+      return response.value;
+    },
+  };
 }
